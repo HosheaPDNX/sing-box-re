@@ -59,6 +59,7 @@ type DNSTransport struct {
 	magicHosts             nDNSResolver.MagicDNSHosts
 	searchDomains          []string
 	defaultResolvers       []adapter.DNSTransport
+	resolverScope          *adapter.Scope
 }
 
 func NewDNSTransport(ctx context.Context, logger log.ContextLogger, tag string, options option.TailscaleDNSServerOptions) (adapter.DNSTransport, error) {
@@ -77,7 +78,7 @@ func NewDNSTransport(ctx context.Context, logger log.ContextLogger, tag string, 
 	}, nil
 }
 
-func (t *DNSTransport) Start(stage adapter.StartStage) error {
+func (t *DNSTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateInitialize {
 		return nil
 	}
@@ -94,6 +95,21 @@ func (t *DNSTransport) Start(stage adapter.StartStage) error {
 	}
 	ep.onReconfigHook = t.onReconfig
 	t.endpoint = ep
+	scope.Add(func() error {
+		t.access.Lock()
+		resolverScope := t.resolverScope
+		t.routePrefixes = nil
+		t.routes = nil
+		t.hosts = nil
+		t.magicHosts = nil
+		t.defaultResolvers = nil
+		t.resolverScope = nil
+		t.access.Unlock()
+		if resolverScope != nil {
+			return resolverScope.Close()
+		}
+		return nil
+	})
 	return nil
 }
 
@@ -119,17 +135,18 @@ func (t *DNSTransport) updateDNSServers(routeConfig *router.Config, dnsConfig *n
 		directDialer := common.Must1(dialer.NewDefault(t.ctx, option.DialerOptions{}))
 		return &DNSDialer{transport: t, fallbackDialer: directDialer}
 	})
+	resolverScope := adapter.NewScope(t.ctx, t.logger)
 	routes := make(map[string][]adapter.DNSTransport)
 	for domain, resolvers := range dnsConfig.Routes {
 		var myResolvers []adapter.DNSTransport
 		for _, resolver := range resolvers {
-			myResolver, err := t.createResolver(directDialerOnce, resolver)
+			myResolver, err := t.createResolver(resolverScope, directDialerOnce, resolver)
 			if err != nil {
-				return err
+				return E.Errors(err, resolverScope.Close())
 			}
 			myResolvers = append(myResolvers, myResolver)
 		}
-		routes[domain.WithTrailingDot()] = myResolvers
+		routes[mDNS.CanonicalName(domain.WithTrailingDot())] = myResolvers
 	}
 	hosts := make(map[string][]netip.Addr)
 	for domain, addresses := range dnsConfig.Hosts {
@@ -140,25 +157,26 @@ func (t *DNSTransport) updateDNSServers(routeConfig *router.Config, dnsConfig *n
 	})
 	var defaultResolvers []adapter.DNSTransport
 	for _, resolver := range dnsConfig.DefaultResolvers {
-		myResolver, err := t.createResolver(directDialerOnce, resolver)
+		myResolver, err := t.createResolver(resolverScope, directDialerOnce, resolver)
 		if err != nil {
-			return err
+			return E.Errors(err, resolverScope.Close())
 		}
 		defaultResolvers = append(defaultResolvers, myResolver)
 	}
 
 	t.access.Lock()
-	oldResolvers := t.collectResolversLocked()
+	oldResolverScope := t.resolverScope
 	t.routePrefixes = routePrefixes
 	t.routes = routes
 	t.hosts = hosts
 	t.magicHosts = t.endpoint.server.ExportLocalBackend().ExportMagicDNSHosts()
 	t.searchDomains = searchDomains
 	t.defaultResolvers = defaultResolvers
+	t.resolverScope = resolverScope
 	t.access.Unlock()
 
-	for _, transport := range oldResolvers {
-		transport.Close()
+	if oldResolverScope != nil {
+		oldResolverScope.Close()
 	}
 
 	if len(defaultResolvers) > 0 {
@@ -170,7 +188,7 @@ func (t *DNSTransport) updateDNSServers(routeConfig *router.Config, dnsConfig *n
 	return nil
 }
 
-func (t *DNSTransport) createResolver(directDialer func() N.Dialer, resolver *dnstype.Resolver) (adapter.DNSTransport, error) {
+func (t *DNSTransport) createResolver(resolverScope *adapter.Scope, directDialer func() N.Dialer, resolver *dnstype.Resolver) (adapter.DNSTransport, error) {
 	serverURL, parseURLErr := url.Parse(resolver.Addr)
 	isHTTPScheme := parseURLErr == nil && (serverURL.Scheme == "http" || serverURL.Scheme == "https")
 	var myDialer N.Dialer
@@ -181,27 +199,47 @@ func (t *DNSTransport) createResolver(directDialer func() N.Dialer, resolver *dn
 	}
 	if len(resolver.BootstrapResolution) > 0 {
 		bootstrapTransport := transport.NewUDPRaw(t.logger, t.TransportAdapter, myDialer, M.SocksaddrFrom(resolver.BootstrapResolution[0], 53))
+		err := bootstrapTransport.Start(adapter.StartStateStart, resolverScope)
+		if err != nil {
+			return nil, err
+		}
 		myDialer = dialer.NewResolveDialer(t.ctx, myDialer, false, "", adapter.DNSQueryOptions{Transport: bootstrapTransport}, 0)
 	} else {
 		myDialer = dialer.NewResolveDialer(t.ctx, myDialer, false, "", t.endpoint.queryOptions, 0)
 	}
 	if isHTTPScheme {
+		if serverURL.Hostname() == "" {
+			return nil, E.New("missing host in resolver address: ", resolver.Addr)
+		}
 		serverAddr := M.ParseSocksaddrHostPortStr(serverURL.Hostname(), serverURL.Port())
 		switch serverURL.Scheme {
 		case "https":
 			if serverAddr.Port == 0 {
 				serverAddr.Port = 443
 			}
-			tlsConfig := common.Must1(tls.NewClient(t.ctx, t.logger, serverAddr.AddrString(), option.OutboundTLSOptions{
+			tlsConfig, err := tls.NewClient(t.ctx, t.logger, serverAddr.AddrString(), option.OutboundTLSOptions{
 				Enabled: true,
 				ALPN:    []string{http2.NextProtoTLS, "http/1.1"},
-			}))
-			return transport.NewHTTPSRaw(t.TransportAdapter, t.logger, myDialer, serverURL, http.Header{}, serverAddr, tlsConfig), nil
+			})
+			if err != nil {
+				return nil, E.Cause(err, "create TLS config for resolver ", resolver.Addr)
+			}
+			httpsTransport := transport.NewHTTPSRaw(t.TransportAdapter, t.logger, myDialer, serverURL, http.Header{}, serverAddr, tlsConfig)
+			err = httpsTransport.Start(adapter.StartStateStart, resolverScope)
+			if err != nil {
+				return nil, err
+			}
+			return httpsTransport, nil
 		case "http":
 			if serverAddr.Port == 0 {
 				serverAddr.Port = 80
 			}
-			return transport.NewHTTPSRaw(t.TransportAdapter, t.logger, myDialer, serverURL, http.Header{}, serverAddr, nil), nil
+			httpTransport := transport.NewHTTPSRaw(t.TransportAdapter, t.logger, myDialer, serverURL, http.Header{}, serverAddr, nil)
+			err := httpTransport.Start(adapter.StartStateStart, resolverScope)
+			if err != nil {
+				return nil, err
+			}
+			return httpTransport, nil
 		}
 	}
 	serverAddr := M.ParseSocksaddr(resolver.Addr)
@@ -214,7 +252,12 @@ func (t *DNSTransport) createResolver(directDialer func() N.Dialer, resolver *dn
 	if serverAddr.Port == 0 {
 		serverAddr.Port = 53
 	}
-	return transport.NewUDPRaw(t.logger, t.TransportAdapter, myDialer, serverAddr), nil
+	udpTransport := transport.NewUDPRaw(t.logger, t.TransportAdapter, myDialer, serverAddr)
+	err := udpTransport.Start(adapter.StartStateStart, resolverScope)
+	if err != nil {
+		return nil, err
+	}
+	return udpTransport, nil
 }
 
 func buildRoutePrefixes(routeConfig *router.Config) []netip.Prefix {
@@ -238,26 +281,6 @@ func buildRoutePrefixes(routeConfig *router.Config) []netip.Prefix {
 	return ipSet.Prefixes()
 }
 
-func (t *DNSTransport) Close() error {
-	t.access.Lock()
-	transports := t.collectResolversLocked()
-	t.routePrefixes = nil
-	t.routes = nil
-	t.hosts = nil
-	t.magicHosts = nil
-	t.defaultResolvers = nil
-	t.access.Unlock()
-
-	var err error
-	for _, transport := range transports {
-		name := "resolver/" + transport.Type() + "[" + transport.Tag() + "]"
-		err = E.Append(err, transport.Close(), func(err error) error {
-			return E.Cause(err, "close ", name)
-		})
-	}
-	return err
-}
-
 func (t *DNSTransport) Raw() bool {
 	return true
 }
@@ -275,12 +298,23 @@ func (t *DNSTransport) PreferredDomain(domain string) bool {
 	if t.acceptSearchDomain && len(searchDomains) > 0 && mDNS.CountLabel(domain) == 1 {
 		return true
 	}
+	canonicalDomain := mDNS.CanonicalName(domain)
 	for suffix := range routes {
-		if mDNS.IsSubDomain(suffix, domain) {
+		if matchDomainSuffix(canonicalDomain, suffix) {
 			return true
 		}
 	}
 	return false
+}
+
+func matchDomainSuffix(domain string, suffix string) bool {
+	if suffix == "." || suffix == "" {
+		return true
+	}
+	if !strings.HasSuffix(domain, suffix) {
+		return false
+	}
+	return len(domain) == len(suffix) || domain[len(domain)-len(suffix)-1] == '.'
 }
 
 func (t *DNSTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
@@ -375,8 +409,9 @@ func (t *DNSTransport) exchangeOnce(ctx context.Context, message *mDNS.Msg, allo
 		}
 		return
 	}
+	canonicalName := mDNS.CanonicalName(question.Name)
 	for domainSuffix, transports := range routes {
-		if mDNS.IsSubDomain(domainSuffix, question.Name) {
+		if matchDomainSuffix(canonicalName, domainSuffix) {
 			if len(transports) == 0 {
 				callback(&mDNS.Msg{
 					MsgHdr: mDNS.MsgHdr{

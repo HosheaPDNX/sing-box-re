@@ -39,8 +39,11 @@ func (f Formatter) Format(ctx context.Context, level Level, tag string, message 
 	}
 	var id ID
 	var hasId bool
+	var parentID ID
+	var hasParentID bool
 	if ctx != nil {
 		id, hasId = IDFromContext(ctx)
+		parentID, hasParentID = ParentIDFromContext(ctx)
 	}
 	if hasId {
 		activeDuration := FormatDuration(time.Since(id.CreatedAt))
@@ -64,9 +67,17 @@ func (f Formatter) Format(ctx context.Context, level Level, tag string, message 
 			color += 16
 			color = color << 16
 			color |= 1 << 14
-			message = F.ToString("[", aurora.Colorize(id.ID, color).String(), " ", activeDuration, "] ", message)
+			if hasParentID {
+				message = F.ToString("[", aurora.Colorize(id.ID, color).String(), " ", activeDuration, " parent=", parentID.ID, "] ", message)
+			} else {
+				message = F.ToString("[", aurora.Colorize(id.ID, color).String(), " ", activeDuration, "] ", message)
+			}
 		} else {
-			message = F.ToString("[", id.ID, " ", activeDuration, "] ", message)
+			if hasParentID {
+				message = F.ToString("[", id.ID, " ", activeDuration, " parent=", parentID.ID, "] ", message)
+			} else {
+				message = F.ToString("[", id.ID, " ", activeDuration, "] ", message)
+			}
 		}
 	}
 	switch {
@@ -109,8 +120,11 @@ func (f Formatter) FormatWithSimple(ctx context.Context, level Level, tag string
 	messageSimple := message
 	var id ID
 	var hasId bool
+	var parentID ID
+	var hasParentID bool
 	if ctx != nil {
 		id, hasId = IDFromContext(ctx)
+		parentID, hasParentID = ParentIDFromContext(ctx)
 	}
 	if hasId {
 		activeDuration := FormatDuration(time.Since(id.CreatedAt))
@@ -134,12 +148,23 @@ func (f Formatter) FormatWithSimple(ctx context.Context, level Level, tag string
 			color += 16
 			color = color << 16
 			color |= 1 << 14
-			message = F.ToString("[", aurora.Colorize(id.ID, color).String(), " ", activeDuration, "] ", message)
+			if hasParentID {
+				message = F.ToString("[", aurora.Colorize(id.ID, color).String(), " ", activeDuration, " parent=", parentID.ID, "] ", message)
+			} else {
+				message = F.ToString("[", aurora.Colorize(id.ID, color).String(), " ", activeDuration, "] ", message)
+			}
 		} else {
-			message = F.ToString("[", id.ID, " ", activeDuration, "] ", message)
+			if hasParentID {
+				message = F.ToString("[", id.ID, " ", activeDuration, " parent=", parentID.ID, "] ", message)
+			} else {
+				message = F.ToString("[", id.ID, " ", activeDuration, "] ", message)
+			}
 		}
-		messageSimple = F.ToString("[", id.ID, " ", activeDuration, "] ", messageSimple)
-
+		if hasParentID {
+			messageSimple = F.ToString("[", id.ID, " ", activeDuration, " parent=", parentID.ID, "] ", messageSimple)
+		} else {
+			messageSimple = F.ToString("[", id.ID, " ", activeDuration, "] ", messageSimple)
+		}
 	}
 	switch {
 	case f.DisableTimestamp:

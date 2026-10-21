@@ -39,7 +39,7 @@ func NewRouterWithOptions(router adapter.ConnectionRouterEx, logger logger.Conte
 	}
 	service, err := mux.NewService(mux.ServiceOptions{
 		NewStreamContext: func(ctx context.Context, conn net.Conn) context.Context {
-			return log.ContextWithNewID(ctx)
+			return log.ContextWithNewChildID(ctx)
 		},
 		Logger:    logger,
 		HandlerEx: adapter.NewRouteContextHandler(router),
